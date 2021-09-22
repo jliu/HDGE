@@ -8,6 +8,7 @@ from collections import OrderedDict
 from os.path import abspath, dirname
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 import torch.nn as nn
 from tqdm import tqdm
@@ -20,11 +21,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def get_model_and_buffer(args, sample_q):
-    if args.pxycontrast > 0 or args.pxcontrast > 0:
-        f = HYM(args)
-    else:
-        model_cls = F if args.uncond else CCF
-        f = model_cls(args)
+    f = HYM(args)
     if not args.uncond:
         assert args.buffer_size % args.n_classes == 0, "Buffer size must be divisible by args.n_classes"
     if args.load_path is None:
@@ -75,7 +72,13 @@ def get_sample_q(args):
                     dist = smooth_one_hot(y, args.n_classes, args.smoothing)
                 else:
                     dist = torch.ones((bs, args.n_classes)).to(device)
-                output, target, ce_output, neg_num = f.joint(img=x_k, dist=dist, evaluation=True)
+                if args.correct:
+                    output, target, ce_output, neg_num = f.joint_correct(
+                            img=x_k, dist=dist, evaluation=True,
+                            normalize_logits=args.normalize_logits)
+                else:
+                    output, target, ce_output, neg_num = f.joint_original(
+                            img=x_k, dist=dist, evaluation=True)
                 energy = -1.0 * nn.CrossEntropyLoss(reduction="mean")(output, target)
             f_prime = torch.autograd.grad(energy, [x_k], retain_graph=True)[0]
             x_k.data += args.sgld_lr * f_prime + args.sgld_std * torch.randn_like(x_k)
@@ -104,9 +107,16 @@ def main(args):
     else:
         optim = torch.optim.SGD(params, lr=args.lr, momentum=0.9, weight_decay=args.weight_decay)
 
-    best_valid_acc = 0.0
-    cur_iter = 0
+    epoch_disc_losses = []
+    epoch_contrast_losses = []
+    epoch_all_losses = []
+    epoch_test_acc = []
+    epoch_valid_acc = []
     for epoch in range(args.start_epoch, args.n_epochs):
+        cur_iter = 0
+        disc_losses = []
+        contrast_losses = []
+        all_losses = []
 
         # Decay lr
         if epoch in args.decay_epochs:
@@ -128,153 +138,66 @@ def main(args):
 
             # Label smoothing
             dist = smooth_one_hot(y_lab, args.n_classes, args.smoothing)
-
             L = 0.0
 
             # log p(y|x) cross entropy loss
+            logits = f.classify(x_lab)
+            l_pyxce = KHotCrossEntropyLoss()(logits, dist)
+            disc_losses.append(l_pyxce.detach().cpu().item())
             if args.pyxce > 0:
-                logits = f.classify(x_lab)
-                l_pyxce = KHotCrossEntropyLoss()(logits, dist)
-                if cur_iter % args.print_every == 0:
-                    acc = (logits.max(1)[1] == y_lab).float().mean()
-                    print("p(y|x)CE {}:{:>d} loss={:>14.9f}, acc={:>14.9f}".format(epoch, cur_iter, l_pyxce.item(), acc.item()))
-                    logger.record_dict({"l_pyxce": l_pyxce.cpu().data.item(), "acc_pyxce": acc.item()})
                 L += args.pyxce * l_pyxce
 
-            # log p(x) using sgld
-            if args.pxsgld > 0:
-                if args.class_cond_p_x_sample:
-                    assert not args.uncond, "can only draw class-conditional samples if EBM is class-cond"
-                    y_q = torch.randint(0, args.n_classes, (args.sgld_batch_size,)).to(device)
-                    x_q = sample_q(f, replay_buffer, y=y_q)
-                else:
-                    x_q = sample_q(f, replay_buffer)  # sample from log-sumexp
-                fp_all = f(x_p_d)
-                fq_all = f(x_q)
-                fp = fp_all.mean()
-                fq = fq_all.mean()
-                l_pxsgld = -(fp - fq)
-                if cur_iter % args.print_every == 0:
-                    print("p(x)SGLD | {}:{:>d} loss={:>14.9f} f(x_p_d)={:>14.9f} f(x_q)={:>14.9f}".format(epoch, i, l_pxsgld, fp, fq))
-                    logger.record_dict({"l_pxsgld": l_pxsgld.cpu().data.item()})
-                L += args.pxsgld * l_pxsgld
-
-            # log p(x) using contrastive learning
-            if args.pxcontrast > 0:
-                # ones like dist to use all indexes
-                ones_dist = torch.ones_like(dist).to(device)
-                output, target, ce_output, neg_num = f.joint(img=x_lab, dist=ones_dist)
-                l_pxcontrast = nn.CrossEntropyLoss(reduction="mean")(output, target)
-                if cur_iter % args.print_every == 0:
-                    acc = (ce_output.max(1)[1] == y_lab).float().mean()
-                    print("p(x)Contrast {}:{:>d} loss={:>14.9f}, acc={:>14.9f}".format(epoch, cur_iter, l_pxcontrast.item(), acc.item()))
-                    logger.record_dict({"l_pxcontrast": l_pxcontrast.cpu().data.item(), "acc_pxcontrast": acc.item()})
-                L += args.pxycontrast * l_pxcontrast
-
-            # log p(x|y) using sgld
-            if args.pxysgld > 0:
-                x_q_lab = sample_q(f, replay_buffer, y=y_lab)
-                fp, fq = f(x_lab).mean(), f(x_q_lab).mean()
-                l_pxysgld = -(fp - fq)
-                if cur_iter % args.print_every == 0:
-                    print("p(x|y)SGLD | {}:{:>d} loss={:>14.9f} f(x_p_d)={:>14.9f} f(x_q)={:>14.9f}".format(epoch, i, l_pxysgld.item(), fp, fq))
-                    logger.record_dict({"l_pxysgld": l_pxysgld.cpu().data.item()})
-                L += args.pxsgld * l_pxysgld
-
             # log p(x|y) using contrastive learning
+            if args.correct:
+                output, target, ce_output, neg_num = f.joint_correct(
+                        img=x_lab, dist=dist, normalize_logits=args.normalize_logits)
+            else:
+                output, target, ce_output, neg_num = f.joint_original(
+                        img=x_lab, dist=dist)
+            l_pxycontrast = nn.CrossEntropyLoss(reduction="mean")(output, target)
+            contrast_losses.append(l_pxycontrast.detach().cpu().item())
             if args.pxycontrast > 0:
-                output, target, ce_output, neg_num = f.joint(img=x_lab, dist=dist)
-                l_pxycontrast = nn.CrossEntropyLoss(reduction="mean")(output, target)
-                if cur_iter % args.print_every == 0:
-                    acc = (ce_output.max(1)[1] == y_lab).float().mean()
-                    print("p(x|y)Contrast {}:{:>d} loss={:>14.9f}, acc={:>14.9f}".format(epoch, cur_iter, l_pxycontrast.item(), acc.item()))
-                    logger.record_dict({"l_pxycontrast": l_pxycontrast.cpu().data.item(), "acc_pxycontrast": acc.item()})
                 L += args.pxycontrast * l_pxycontrast
 
-            # SGLD training of log q(x) may diverge
-            # break here and record information to restart
-            if L.abs().item() > 1e8:
-                print("restart epoch: {}".format(epoch))
-                print("save dir: {}".format(args.log_dir))
-                print("id: {}".format(args.id))
-                print("steps: {}".format(args.n_steps))
-                print("seed: {}".format(args.seed))
-                print("exp prefix: {}".format(args.exp_prefix))
-                sys.stdout = sys.__stdout__
-                sys.stderr = sys.__stderr__
-                print("restart epoch: {}".format(epoch))
-                print("save dir: {}".format(args.log_dir))
-                print("id: {}".format(args.id))
-                print("steps: {}".format(args.n_steps))
-                print("seed: {}".format(args.seed))
-                print("exp prefix: {}".format(args.exp_prefix))
-                assert False, "shit loss explode..."
+            all_losses.append(L.detach().cpu().item())
+            acc = (logits.max(1)[1] == y_lab).float().mean()
+            if cur_iter % args.print_every == 0:
+                print("epoch {}, iter {}\n disc_loss {:.3f}, contrast_loss {:.3f}, total_loss {:.3f}, acc {:.3f}".format(
+                    epoch, cur_iter, l_pyxce.item(), l_pxycontrast.item(), L.item(), acc.item()))
+ 
 
             optim.zero_grad()
             L.backward()
             optim.step()
             cur_iter += 1
 
-        if epoch % args.plot_every == 0:
-            if args.plot_uncond:
-                if args.class_cond_p_x_sample:
-                    assert not args.uncond, "can only draw class-conditional samples if EBM is class-cond"
-                    y_q = torch.randint(0, args.n_classes, (args.sgld_batch_size,)).to(device)
-                    x_q = sample_q(f, replay_buffer, y=y_q)
-                    plot("{}/x_q_{}_{:>06d}.png".format(args.log_dir, epoch, i), x_q)
-                    if args.plot_contrast:
-                        x_q = sample_q(f, replay_buffer, y=y_q, contrast=True)
-                        plot("{}/contrast_x_q_{}_{:>06d}.png".format(args.log_dir, epoch, i), x_q)
-                else:
-                    x_q = sample_q(f, replay_buffer)
-                    plot("{}/x_q_{}_{:>06d}.png".format(args.log_dir, epoch, i), x_q)
-                    if args.plot_contrast:
-                        x_q = sample_q(f, replay_buffer, contrast=True)
-                        plot("{}/contrast_x_q_{}_{:>06d}.png".format(args.log_dir, epoch, i), x_q)
-            if args.plot_cond:  # generate class-conditional samples
-                y = torch.arange(0, args.n_classes)[None].repeat(args.n_classes, 1).transpose(1, 0).contiguous().view(-1).to(device)
-                x_q_y = sample_q(f, replay_buffer, y=y)
-                plot("{}/x_q_y{}_{:>06d}.png".format(args.log_dir, epoch, i), x_q_y)
-                if args.plot_contrast:
-                    y = torch.arange(0, args.n_classes)[None].repeat(args.n_classes, 1).transpose(1, 0).contiguous().view(-1).to(device)
-                    x_q_y = sample_q(f, replay_buffer, y=y, contrast=True)
-                    plot("{}/contrast_x_q_y_{}_{:>06d}.png".format(args.log_dir, epoch, i), x_q_y)
-
-        if args.ckpt_every > 0 and epoch % args.ckpt_every == 0:
-            checkpoint(f, replay_buffer, f"ckpt_{epoch}.pt", args)
+        epoch_disc_losses.append(np.mean(disc_losses))
+        epoch_contrast_losses.append(np.mean(contrast_losses))
+        epoch_all_losses.append(np.mean(all_losses))
 
         if epoch % args.eval_every == 0:
-            # Validation set
-            correct, val_loss = eval_classification(f, dload_valid)
-            if correct > best_valid_acc:
-                best_valid_acc = correct
-                print("Best Valid!: {}".format(correct))
-                checkpoint(f, replay_buffer, "best_valid_ckpt.pt", args)
-            # Test set
-            correct, test_loss = eval_classification(f, dload_test)
-            print("Epoch {}: Valid Loss {}, Valid Acc {}".format(epoch, val_loss, correct))
-            print("Epoch {}: Test Loss {}, Test Acc {}".format(epoch, test_loss, correct))
+            valid_correct, val_loss = eval_classification(f, dload_valid)
+            test_correct, test_loss = eval_classification(f, dload_test)
+            valid_correct /= 100
+            test_correct /= 100
+            epoch_valid_acc.append(valid_correct.detach().cpu().item())
+            epoch_test_acc.append(test_correct.detach().cpu().item())
+            print("EVAL val_correct {} test_correct {}'".format(valid_correct, test_correct))
             f.train()
-            logger.record_dict(
-                {
-                    "Epoch": epoch,
-                    "Valid Loss": val_loss,
-                    "Valid Acc": correct.detach().cpu().numpy(),
-                    "Test Loss": test_loss,
-                    "Test Acc": correct.detach().cpu().numpy(),
-                    "Best Valid": best_valid_acc.detach().cpu().numpy(),
-                    "Loss": L.cpu().data.item(),
-                }
-            )
-        checkpoint(f, replay_buffer, "last_ckpt.pt", args)
 
-        logger.dump_tabular()
-
+        if epoch % args.write_losses_every == 0:
+            filename = '{}/losses_{}.npz'.format(args.log_dir, epoch)
+            np.savez(filename,
+                    total_loss=epoch_all_losses,
+                    disc_loss=epoch_disc_losses,
+                    contrast_loss=epoch_contrast_losses,
+                    test_acc=epoch_test_acc,
+                    valid_acc=epoch_valid_acc)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Hybrid training via contrastive learning")
     parser.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "svhn", "cifar100"])
-    parser.add_argument("--data_root", type=str, default="/data/lhao/")
+    parser.add_argument("--data_root", type=str, default="./data")
     # optimization
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--decay_epochs", nargs="+", type=int, default=[160, 180], help="decay learning rate by decay_rate at these epochs")
@@ -285,7 +208,7 @@ if __name__ == "__main__":
     parser.add_argument("--optimizer", choices=["adam", "sgd"], default="adam")
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--sgld_batch_size", type=int, default=64)
-    parser.add_argument("--n_epochs", type=int, default=200)
+    parser.add_argument("--n_epochs", type=int, default=100)
     parser.add_argument("--warmup_iters", type=int, default=-1, help="number of iters to linearly increase learning rate, if -1 then no warmmup")
     # loss weighting
     parser.add_argument("--pyxce", type=float, default=0.0)
@@ -331,8 +254,12 @@ if __name__ == "__main__":
     parser.add_argument("--load_path", type=str, default=None)
     parser.add_argument("--plot_uncond", choices=[0, 1], type=float, default=0)
     parser.add_argument("--plot_cond", choices=[0, 1], type=float, default=0)
-    parser.add_argument("--plot_contrast", choices=[0, 1], type=float, default=0)
     parser.add_argument("--n_valid", type=int, default=5000)
+
+    # Additional args for correct version of HDGE.
+    parser.add_argument('--correct', action='store_true')
+    parser.add_argument('--normalize_logits', action='store_true')
+    parser.add_argument('--write_losses_every', type=int, default=10)
     args = parser.parse_args()
 
     if args.load_path is not None:
@@ -360,7 +287,6 @@ if __name__ == "__main__":
         args.exp_prefix = exp_prefix
         args.log_dir = f"{args.log_dir}/{exp_prefix}"
 
-    args.plot_contrast = 1 if (args.pxycontrast > 0 and args.plot_contrast) else 0
     args.n_classes = 100 if args.dataset == "cifar100" else 10
     set_seed(args)
     os.makedirs(args.log_dir, exist_ok=True)
@@ -368,6 +294,5 @@ if __name__ == "__main__":
     setup_logger(exp_prefix=args.exp_prefix, variant=configs, log_dir=args.log_dir)
     with open(f"{args.log_dir}/params.txt", "w") as f:
         json.dump(args.__dict__, f)
-    sys.stdout = open(f"{args.log_dir}/log.txt", "a")
 
     main(args)

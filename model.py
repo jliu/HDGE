@@ -60,10 +60,14 @@ class HYM(CCF):
 
         self.queue_ptr[0] = ptr
 
-    def joint(self, img, dist=None, evaluation=False):
+    def joint_original(self,
+                       img,
+                       dist=None,
+                       evaluation=False):
         f_logit = self.class_output(self.f(img))  # queries: NxC
         ce_logit = f_logit  # cross-entropy loss logits
         prob = nn.functional.normalize(f_logit, dim=1)
+
         # positive logits: Nx1
         l_pos = dist * prob  # NxC
         l_pos = torch.logsumexp(l_pos, dim=1, keepdim=True)  # Nx1
@@ -86,3 +90,34 @@ class HYM(CCF):
             self._dequeue_and_enqueue(f_logit)
 
         return logits, labels, ce_logit, l_neg.size(1)
+
+    def joint_correct(self,
+                      img,
+                      dist=None,
+                      evaluation=False,
+                      normalize_logits=False):
+        logits = self.class_output(self.f(img))  # queries: NxC
+        if normalize_logits:
+            logits = nn.functional.normalize(logits, dim=-1)
+
+        # pos logits
+        pos_logits = torch.sum(dist * logits, dim=-1, keepdim=True)
+
+        # negative logits: NxK
+        buffer = self.queue_logit.clone().detach()
+        neg_logits = torch.matmul(dist, buffer)
+
+        # logits: Nx(1+K)
+        to_ret = torch.cat([pos_logits, neg_logits], dim=1)
+
+        # apply temperature
+        to_ret /= self.T
+
+        # labels: positive key indicators
+        labels = torch.zeros(to_ret.shape[0], dtype=torch.long).cuda()
+
+        # dequeue and enqueue
+        if not evaluation:
+            self._dequeue_and_enqueue(logits)
+
+        return to_ret, labels, logits, neg_logits.size(1)
